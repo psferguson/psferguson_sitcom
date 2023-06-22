@@ -175,7 +175,7 @@ if __name__ == '__main__':
     if not os.path.exists("./data/"):
         os.makedirs("./data/")
     
-    start_date = Time("2023-06-03T14:01:00", scale='utc')
+    start_date = Time("2023-04-28T14:01:00", scale='utc')
     end_date =Time("2023-06-22T14:01:00", scale='utc')
     window = TimeDelta(24*60*60, format = 'sec')
     id_oscillations=identify_oscillation_events()
