@@ -86,6 +86,16 @@ class identify_oscillation_events():
                 return
             self.query_dict["el"]=self.add_timestamp(self.query_dict["el"])
             
+            
+            self.query_dict["az"] = await client.select_time_series('lsst.sal.MTMount.azimuth', \
+                                        ['*'],  
+                                        self.start_time, self.end_time)
+            if  ("private_sndStamp" not in self.query_dict["az"].keys()):
+                print("no az data")
+                self.query_dict=None
+                return
+            self.query_dict["az"]=self.add_timestamp(self.query_dict["az"])
+            
 
             self.query_dict["hpmf"] = await client.select_time_series('lsst.sal.MTM1M3.hardpointActuatorData',
                                                     ['private_sndStamp',
@@ -153,19 +163,29 @@ class identify_oscillation_events():
 
         #identify when we are slewing
         overall_frame["slew_state"]=False
-        slew_speed=interp1d(self.query_dict["el"]["snd_timestamp_utc"],
+        slew_speed_el=interp1d(self.query_dict["el"]["snd_timestamp_utc"],
                             abs(self.query_dict["el"]["actualVelocity"].rolling(10).mean()),
                             bounds_error=False)
-        slew_velocity=interp1d(self.query_dict["el"]["snd_timestamp_utc"],
+        slew_speed_az=interp1d(self.query_dict["az"]["snd_timestamp_utc"],
+                            abs(self.query_dict["az"]["actualVelocity"].rolling(10).mean()),
+                            bounds_error=False)
+        
+        slew_velocity_el=interp1d(self.query_dict["el"]["snd_timestamp_utc"],
                                (self.query_dict["el"]["actualVelocity"].rolling(10).mean()),
                                bounds_error=False)
+        slew_velocity_az=interp1d(self.query_dict["az"]["snd_timestamp_utc"],
+                               (self.query_dict["az"]["actualVelocity"].rolling(10).mean()),
+                               bounds_error=False)
+        
         slew_position=interp1d(self.query_dict["el"]["snd_timestamp_utc"],
                                (self.query_dict["el"]["actualPosition"].rolling(10).mean()),
                                bounds_error=False)
         
-        sel=(slew_speed(overall_frame["times"]) > slew_speed_min)
+        sel=(slew_speed_el(overall_frame["times"]) > slew_speed_min) 
+        sel |= (slew_speed_az(overall_frame["times"]) > slew_speed_min)
         overall_frame.loc[sel,"slew_state"]=True
-        overall_frame["elevation_velocity"]=slew_velocity(overall_frame["times"])
+        overall_frame["elevation_velocity"]=slew_velocity_el(overall_frame["times"])
+        overall_frame["azimuth_velocity"]=slew_velocity_az(overall_frame["times"])
         overall_frame["elevation_position"]=slew_position(overall_frame["times"])
         overall_frame=overall_frame.loc[overall_frame["slew_state"]==True,:]
         return overall_frame
@@ -176,7 +196,7 @@ if __name__ == '__main__':
         os.makedirs("./data/")
     
     start_date = Time("2023-04-28T14:01:00", scale='utc')
-    end_date =Time("2023-06-22T14:01:00", scale='utc')
+    end_date =Time("2023-06-24T14:01:00", scale='utc')
     window = TimeDelta(24*60*60, format = 'sec')
     id_oscillations=identify_oscillation_events()
     
