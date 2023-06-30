@@ -48,6 +48,7 @@ class identify_oscillation_events():
         super_times = []
         super_counts = [] 
         super_actuators= []
+        super_rmean =[]
         for peak in peak_frame["times"].values:
             sel = (abs(peak_frame["times"]-peak) < window)
             subframe=peak_frame[sel]
@@ -58,15 +59,31 @@ class identify_oscillation_events():
                 super_heights.append(max_height)
                 super_times.append(subframe["times"][subframe["heights"]==max_height].values)
                 super_actuators.append(subframe["actuators"][subframe["heights"]==max_height].values)
+                super_rmean.append(subframe["rmean"][subframe["heights"]==max_height].values)
+        if len(super_times)==0:
+            return pd.DataFrame({"times":super_times,
+                             "heights":super_heights,
+                             "rmean":super_rmean,
+                             "counts":super_counts, 
+                             "actuators":super_actuators})
         super_times = np.concatenate(super_times)
         super_actuators = np.concatenate(super_actuators)
+        super_rmean=np.concatenate(super_rmean)
         super_heights=np.array(super_heights)
         super_counts=np.array(super_counts)
+        
+        
         super_times, super_inds=np.unique(super_times, return_index=True)
         super_heights=super_heights[super_inds]
         super_actuators=super_actuators[super_inds]
         super_counts=super_counts[super_inds]
-        return pd.DataFrame({"times":super_times,"heights":super_heights,"counts":super_counts, "actuators":super_actuators})
+        super_rmean=super_rmean[super_inds]
+        #import pdb;pdb.set_trace()
+        return pd.DataFrame({"times":super_times,
+                             "heights":super_heights,
+                             "rmean":super_rmean,
+                             "counts":super_counts, 
+                             "actuators":super_actuators})
 
     async def get_data(self):
             "Extract all the MTMount data from the EFD and save to parquet files"
@@ -74,7 +91,7 @@ class identify_oscillation_events():
             # Get EFD client options are usdf_efd or summit_efd
             
             
-            client = EfdClient('usdf_efd')
+            client = EfdClient('summit_efd')
 
             self.query_dict={}
             self.query_dict["el"] = await client.select_time_series('lsst.sal.MTMount.elevation', \
@@ -126,7 +143,7 @@ class identify_oscillation_events():
         association_window_1 = 2 # window in seconds to combine peaks in same actuator
         association_window_2 = 4 # window in seconds to combine peaks accross actuators
         slew_speed_min = 0.01 # used for identifiying when we are slewing
-
+        peak_height=100
         peak_dict={}
         peak_frame=pd.DataFrame({"times":[],"heights":[],"actuators":[]})
 
@@ -134,28 +151,36 @@ class identify_oscillation_events():
         for i in range(6):
             # this loop identifies rolling std peaks in the measured force
             rolling_std_val=self.query_dict["hpmf"][f"measuredForce{i}"].rolling(rolling_std_window).std() # 100 is ~ 2 second window
-            peak_indicies=find_peaks(rolling_std_val, height=50)[0] 
+            rolling_mean_val=self.query_dict["hpmf"][f"measuredForce{i}"].rolling(1000).mean()
+            peak_indicies=find_peaks(rolling_std_val, height=peak_height )[0] 
+            
             
             # keep time and height of peaks
             peak_dict[f"hp_{i}_peak_times"]=self.query_dict["hpmf"]["snd_timestamp_utc"][peak_indicies].values
             peak_dict[f"hp_{i}_peak_heights"]= rolling_std_val[peak_indicies].values
-
+            peak_dict[f"hp_{i}_peak_rmean"] = rolling_mean_val[peak_indicies + 500].values
             # for each peak combine by looking at all peaks within 
             # a window and keeping the one with the largest height then np.unique that 
             super_heights=[]
             super_times=[]
+            super_rmean=[]
             for j,peak in enumerate(peak_dict[f"hp_{i}_peak_times"]):
                 sel_peaks=(abs(peak_dict[f"hp_{i}_peak_times"]-peak) < association_window_1)
                 max_height=np.max(peak_dict[f"hp_{i}_peak_heights"][sel_peaks])
+                #max_rmean=np.max(peak_dict[f"hp_{i}_peak_long_mean"][sel_peaks])
                 max_time=peak_dict[f"hp_{i}_peak_times"][sel_peaks][np.where(peak_dict[f"hp_{i}_peak_heights"][sel_peaks]==max_height)]
                 max_index=np.where(peak_dict[f"hp_{i}_peak_times"]==max_time)[0]
                 super_times.append(peak_dict[f"hp_{i}_peak_times"][max_index])
                 super_heights.append(peak_dict[f"hp_{i}_peak_heights"][max_index])
+                super_rmean.append(peak_dict[f"hp_{i}_peak_rmean"][max_index])
             peak_dict[f"hp_{i}_peak_times"] = np.unique(super_times)
             peak_dict[f"hp_{i}_peak_heights"] = np.unique(super_heights)
+            peak_dict[f"hp_{i}_peak_rmean"] = np.unique(super_rmean)
+            
             peak_frame=pd.concat([peak_frame,pd.DataFrame({"times":peak_dict[f"hp_{i}_peak_times"],
-                                                        "heights":peak_dict[f"hp_{i}_peak_heights"],
-                                                        "actuators":i})])
+                                                           "heights":peak_dict[f"hp_{i}_peak_heights"],
+                                                           "rmean": peak_dict[f"hp_{i}_peak_rmean"],
+                                                           "actuators":i})])
         peak_frame=peak_frame.sort_values("times")
 
         # next we want to combine peaks across actuators
@@ -195,8 +220,8 @@ if __name__ == '__main__':
     if not os.path.exists("./data/"):
         os.makedirs("./data/")
     
-    start_date = Time("2023-04-28T14:01:00", scale='utc')
-    end_date =Time("2023-06-24T14:01:00", scale='utc')
+    start_date = Time("2023-06-25T20:01:00", scale='utc')
+    end_date =Time("2023-06-28T14:01:00", scale='utc')
     window = TimeDelta(24*60*60, format = 'sec')
     id_oscillations=identify_oscillation_events()
     
@@ -205,10 +230,10 @@ if __name__ == '__main__':
         
         end_time=start_time + window
         save_string=f"./data/oscillation_events_{start_time}_to_{end_time}.csv"
-        if os.path.exists(save_string):
-            print(f"file exists: {save_string}")
-            start_time=end_time
-            continue
+        # if os.path.exists(save_string):
+        #     print(f"file exists: {save_string}")
+        #     start_time=end_time
+        #     continue
         print(f"starting query for {start_time} to {end_time} ")
         
     #start_date = Time("2023-06-16T00:00:00", scale='utc')
