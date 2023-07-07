@@ -19,13 +19,23 @@ from astropy.time import Time, TimeDelta
 from scipy.interpolate import UnivariateSpline
 
 from lsst_efd_client import EfdClient
+from lsst.summit.utils.tmaUtils import TMAEventMaker, TMAState
+from lsst.summit.utils.efdUtils import getEfdData, makeEfdClient, calcNextDay
+
 
 from scipy.signal import find_peaks
 from scipy.interpolate import interp1d
+from tqdm import tqdm
+
 
 class identify_oscillation_events():
     def __init__(self):
         self.force="two"
+        self.rolling_std_window = 100  # 100 is ~ 2 second window
+        self.association_window_1 = 2 # window in seconds to combine peaks in same actuator
+        self.association_window_2 = 4 # window in seconds to combine peaks accross actuators
+        self.slew_speed_min = 0.01 # used for identifiying when we are slewing
+        self.peak_height=50
         # self.output_dir=output_dir
         # self.smoothingFactor=0.2 # In spline creation
         # self.kernel_size=100 # In convolution
@@ -39,6 +49,7 @@ class identify_oscillation_events():
         if "snd_timestamp_utc" not in data.columns:
             data["snd_timestamp_utc"]=Time(data["private_sndStamp"], format = "unix_tai").unix
         return data
+    
     def combine_peaks_accross_actuators(self, peak_frame, window=4):
         # takes a set of identified peaks in different actuators and associates nearby 
         # ones default window is 4 seconds, 
@@ -84,19 +95,32 @@ class identify_oscillation_events():
                              "rmean":super_rmean,
                              "counts":super_counts, 
                              "actuators":super_actuators})
-
-    async def get_data(self):
+    async def get_slews(self,day_obs):
+        eventMaker = TMAEventMaker()
+        events = eventMaker.getEvents(int(day_obs))
+        slews = [e for e in events if e.type==TMAState.SLEWING]
+        return slews
+    
+    async def get_data(self, begin, end, client):
             "Extract all the MTMount data from the EFD and save to parquet files"
 
             # Get EFD client options are usdf_efd or summit_efd
             
-            
-            client = EfdClient('summit_efd')
-
             self.query_dict={}
-            self.query_dict["el"] = await client.select_time_series('lsst.sal.MTMount.elevation', \
-                                        ['*'],  
-                                        self.start_time, self.end_time)
+            self.query_dict["day_obs"]=self.day_obs
+            
+            self.query_dict["el"] = getEfdData(client,
+                                               'lsst.sal.MTMount.elevation',
+                                               columns=['private_sndStamp',
+                                                        'actualPosition',
+                                                        'actualVelocity'],
+                                               begin=begin,
+                                               end=end,
+                                               prePadding=10,
+                                               postPadding=10,
+                                               noWarn=True
+                                              )
+            
             if  ("private_sndStamp" not in self.query_dict["el"].keys()):
                 print("no el data")
                 self.query_dict=None
@@ -104,9 +128,18 @@ class identify_oscillation_events():
             self.query_dict["el"]=self.add_timestamp(self.query_dict["el"])
             
             
-            self.query_dict["az"] = await client.select_time_series('lsst.sal.MTMount.azimuth', \
-                                        ['*'],  
-                                        self.start_time, self.end_time)
+            self.query_dict["az"] = getEfdData(client,
+                                               'lsst.sal.MTMount.azimuth',
+                                               columns=['private_sndStamp',
+                                                        'actualPosition',
+                                                        'actualVelocity'],
+                                               begin=begin,
+                                               end=end,
+                                               prePadding=5,
+                                               postPadding=5,
+                                               noWarn=True
+                                              )
+            
             if  ("private_sndStamp" not in self.query_dict["az"].keys()):
                 print("no az data")
                 self.query_dict=None
@@ -114,58 +147,56 @@ class identify_oscillation_events():
             self.query_dict["az"]=self.add_timestamp(self.query_dict["az"])
             
 
-            self.query_dict["hpmf"] = await client.select_time_series('lsst.sal.MTM1M3.hardpointActuatorData',
-                                                    ['private_sndStamp',
-                                                    'measuredForce0', 
-                                                    'measuredForce1', 
-                                                    'measuredForce2', 
-                                                    'measuredForce3',
-                                                    'measuredForce4', 
-                                                    'measuredForce5'],  
-                                                    self.start_time, self.end_time)
+            self.query_dict["hpmf"] = getEfdData(client,
+                                                 'lsst.sal.MTM1M3.hardpointActuatorData',
+                                                 begin=begin,
+                                                 end=end, 
+                                                 prePadding=5,
+                                                 postPadding=5,
+                                                 columns=['private_sndStamp',
+                                                          'measuredForce0', 
+                                                          'measuredForce1', 
+                                                          'measuredForce2', 
+                                                          'measuredForce3',
+                                                          'measuredForce4', 
+                                                          'measuredForce5'
+                                                         ],
+                                                 noWarn=True
+                                                )
             if  ("private_sndStamp" not in self.query_dict["hpmf"].keys()):
                 print("no hpmf data")
                 self.query_dict=None
                 return
-            self.query_dict["hpmf"] = self.add_timestamp(self.query_dict["hpmf"])            
+            self.query_dict["hpmf"] = self.add_timestamp(self.query_dict["hpmf"])
             
-    async def run(self, start_time, end_time):
-        # given hp data iterate over all and create a dict with identified peaks as well as their height
-        
-        self.start_time=start_time
-        self.end_time=end_time
-        # make query
-        await self.get_data()
-        if self.query_dict is None:
+    def identify(self, query_dict):
+        if query_dict is None:
             return None
         
-        rolling_std_window = 100  # 100 is ~ 2 second window
-        association_window_1 = 2 # window in seconds to combine peaks in same actuator
-        association_window_2 = 4 # window in seconds to combine peaks accross actuators
-        slew_speed_min = 0.01 # used for identifiying when we are slewing
-        peak_height=100
         peak_dict={}
         peak_frame=pd.DataFrame({"times":[],"heights":[],"actuators":[]})
-
-
         for i in range(6):
             # this loop identifies rolling std peaks in the measured force
-            rolling_std_val=self.query_dict["hpmf"][f"measuredForce{i}"].rolling(rolling_std_window).std() # 100 is ~ 2 second window
-            rolling_mean_val=self.query_dict["hpmf"][f"measuredForce{i}"].rolling(rolling_std_window).mean()
-            peak_indicies=find_peaks(rolling_std_val, height=peak_height )[0] 
-            
-            
+            rolling_std_val=self.query_dict["hpmf"][f"measuredForce{i}"].rolling(self.rolling_std_window).std() # 100 is ~ 2 second window
+            rolling_mean_val=self.query_dict["hpmf"][f"measuredForce{i}"].rolling(self.rolling_std_window).mean()
+            peak_indicies=find_peaks(rolling_std_val, height=self.peak_height )[0] 
+
+                
             # keep time and height of peaks
             peak_dict[f"hp_{i}_peak_times"]=self.query_dict["hpmf"]["snd_timestamp_utc"][peak_indicies].values
             peak_dict[f"hp_{i}_peak_heights"]= rolling_std_val[peak_indicies].values
-            peak_dict[f"hp_{i}_peak_rmean_diff"] = rolling_mean_val[peak_indicies + 500].values - rolling_mean_val[peak_indicies - 500].values
+            start_ind = [np.max([i - 500,0]) for i in peak_indicies]
+            stop_ind = [np.min([i + 500, len(rolling_mean_val)-1]) for i in peak_indicies]
+            peak_dict[f"hp_{i}_peak_rmean_diff"] = rolling_mean_val[stop_ind].values - rolling_mean_val[start_ind].values
+            
             # for each peak combine by looking at all peaks within 
             # a window and keeping the one with the largest height then np.unique that 
             super_heights=[]
             super_times=[]
             super_rmean=[]
+            
             for j,peak in enumerate(peak_dict[f"hp_{i}_peak_times"]):
-                sel_peaks=(abs(peak_dict[f"hp_{i}_peak_times"]-peak) < association_window_1)
+                sel_peaks=(abs(peak_dict[f"hp_{i}_peak_times"]-peak) < self.association_window_1)
                 max_height=np.max(peak_dict[f"hp_{i}_peak_heights"][sel_peaks])
                 #max_rmean=np.max(peak_dict[f"hp_{i}_peak_long_mean"][sel_peaks])
                 max_time=peak_dict[f"hp_{i}_peak_times"][sel_peaks][np.where(peak_dict[f"hp_{i}_peak_heights"][sel_peaks]==max_height)]
@@ -181,11 +212,11 @@ class identify_oscillation_events():
                                                            "heights":peak_dict[f"hp_{i}_peak_heights"],
                                                            "rmean_diff": peak_dict[f"hp_{i}_peak_rmean_diff"],
                                                            "actuators":i})])
-        peak_frame=peak_frame.sort_values("times")
+            peak_frame=peak_frame.sort_values("times")
 
         # next we want to combine peaks across actuators
-        overall_frame=self.combine_peaks_accross_actuators(peak_frame, window=association_window_2)
-
+        overall_frame=self.combine_peaks_accross_actuators(peak_frame, window=self.association_window_2)
+        print(overall_frame.shape[0])
         #identify when we are slewing
         overall_frame["slew_state"]=False
         slew_speed_el=interp1d(self.query_dict["el"]["snd_timestamp_utc"],
@@ -194,57 +225,111 @@ class identify_oscillation_events():
         slew_speed_az=interp1d(self.query_dict["az"]["snd_timestamp_utc"],
                             abs(self.query_dict["az"]["actualVelocity"].rolling(10).mean()),
                             bounds_error=False)
-        
+
         slew_velocity_el=interp1d(self.query_dict["el"]["snd_timestamp_utc"],
                                (self.query_dict["el"]["actualVelocity"].rolling(10).mean()),
                                bounds_error=False)
         slew_velocity_az=interp1d(self.query_dict["az"]["snd_timestamp_utc"],
                                (self.query_dict["az"]["actualVelocity"].rolling(10).mean()),
                                bounds_error=False)
-        
+
         slew_position=interp1d(self.query_dict["el"]["snd_timestamp_utc"],
                                (self.query_dict["el"]["actualPosition"].rolling(10).mean()),
                                bounds_error=False)
-        
-        sel=(slew_speed_el(overall_frame["times"]) > slew_speed_min) 
-        sel |= (slew_speed_az(overall_frame["times"]) > slew_speed_min)
+
+        sel=(slew_speed_el(overall_frame["times"]) > self.slew_speed_min) 
+        sel |= (slew_speed_az(overall_frame["times"]) > self.slew_speed_min)
         overall_frame.loc[sel,"slew_state"]=True
         overall_frame["elevation_velocity"]=slew_velocity_el(overall_frame["times"])
         overall_frame["azimuth_velocity"]=slew_velocity_az(overall_frame["times"])
         overall_frame["elevation_position"]=slew_position(overall_frame["times"])
         overall_frame=overall_frame.loc[overall_frame["slew_state"]==True,:]
-        return overall_frame
-    
+
+        if len(overall_frame) > 0:
+            overall_frame["seq_num"]=query_dict["seq_num"]
+            overall_frame["day_obs"]=query_dict["day_obs"]
+            return overall_frame
+        else: 
+            return None
+        
+    async def run(self, day_obs):
+        # given hp data iterate over all and create a dict with identified peaks as well as their height
+        self.day_obs=day_obs
+        self.slews= await self.get_slews(day_obs)
+        if len(self.slews) == 0:
+            print("no data")
+            return None
+        self.slews=self.slews
+        # make query
+        client = makeEfdClient()
+        await self.get_data(self.slews[0].begin, self.slews[-1].end, client)
+        event_list=[]
+        return
+        for slew in tqdm(self.slews):
+            warnings.filterwarnings("ignore")
+            
+            np.warnings.filterwarnings('error', category=np.VisibleDeprecationWarning)
+            result=self.identify(slew)
+            if result is not None:
+                event_list.append(result)
+        if len(event_list) > 0:
+            events_frame=pd.concat(event_list)
+            return events_frame
+        else:
+            return None
+        
+        
+
+        
+            
+            
+        
+        
+
+
+        
 if __name__ == '__main__':
+    # want to understand if force actuators are on
+    import warnings
     
     if not os.path.exists("./data/"):
         os.makedirs("./data/")
     
-    start_date = Time("2023-06-25T20:01:00", scale='utc')
-    end_date =Time("2023-06-28T14:01:00", scale='utc')
-    window = TimeDelta(8*60*60, format = 'sec')
+    begin_day_obs = 20230623
+    end_day_obs = 20230627
+    
     id_oscillations=identify_oscillation_events()
     
-    start_time=start_date
-    while start_time < end_date:
+    current_day_obs=begin_day_obs
+    while int(current_day_obs) <= int(end_day_obs):
+        next_day_obs=calcNextDay(current_day_obs)
+        print(current_day_obs)
+        save_string=f"./data/oscillation_events_{current_day_obs}.csv" 
+        if os.path.exists(save_string):
+            print(f"file exists: {save_string}")
+            current_day_obs=next_day_obs
+            continue
+        oscillation_events_frame = asyncio.run(id_oscillations.run(current_day_obs))
+        if oscillation_events_frame is not None:
+            oscillation_events_frame.to_csv(save_string)
+            print("finished")
+
+        current_day_obs=next_day_obs
         
-        end_time=start_time + window
-        save_string=f"./data/oscillation_events_{start_time}_to_{end_time}.csv"
-        # if os.path.exists(save_string):
-        #     print(f"file exists: {save_string}")
+        
+        #
+        # 
         #     start_time=end_time
         #     continue
-        print(f"starting query for {start_time} to {end_time} ")
-        
-    #start_date = Time("2023-06-16T00:00:00", scale='utc')
+        #print(f"starting query for {start_time} to {end_time} ")
+        #await eventMaker.client.influx_client.close()
+        #start_date = Time("2023-06-16T00:00:00", scale='utc')
     
-        overall_frame=asyncio.run(id_oscillations.run(start_time,end_time)) 
-        if overall_frame is not None:
-            overall_frame.to_csv(save_string)
-            print("finished")
-        else:
-            print(f"no data for {save_string} ")
-        start_time=end_time
+        # overall_frame=asyncio.run(id_oscillations.run(start_time,end_time)) 
+        # 
+        # else:
+        #     print(f"no data for {save_string} ")
+        # start_time=end_time
         
         
-    #print(overall_frame)
+        #print(overall_frame)

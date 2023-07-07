@@ -28,6 +28,14 @@ motion_dict[20230628]=pd.DataFrame([(datetime(2023,6,28,15,0),5),
                                   (datetime(2023,6,29,7,20), 30),
                                   (datetime(2023,6,29,8,57), 40),
                                 ], columns=[ "time","motion_percent"])
+
+# 230629
+motion_dict[20230629]=pd.DataFrame([(datetime(2023,6,30,0,59),1),
+                                  (datetime(2023,6,30,2,2), 10),
+                                  (datetime(2023,6,30,2,38), 5),
+                                  (datetime(2023,6,30,3,29), 10),
+                                  (datetime(2023,6,30,4,0), 20),
+                                ], columns=[ "time","motion_percent"])
 # should be run from /projects/tma directory
 for key in motion_dict.keys():
     motion_dict[key].to_csv(f"./data/slew_configs/motion_settings_{key}.csv", index=False)
