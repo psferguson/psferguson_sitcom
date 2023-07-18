@@ -126,7 +126,7 @@ class identify_oscillation_events:
 
     async def get_slews(self, day_obs):
         eventMaker = TMAEventMaker()
-        events = eventMaker.getEvents(int(day_obs))
+        events = eventMaker.getEvents(int(day_obs),)
         slews = [e for e in events if e.type == TMAState.SLEWING]
         return slews
 
@@ -137,6 +137,30 @@ class identify_oscillation_events:
 
         self.query_dict = {}
         self.query_dict["day_obs"] = self.day_obs
+        
+        self.query_dict["hpmf"] = getEfdData(
+            client,
+            "lsst.sal.MTM1M3.hardpointActuatorData",
+            begin=begin,
+            end=end,
+            prePadding=5,
+            postPadding=5,
+            columns=[
+                "private_sndStamp",
+                "measuredForce0",
+                "measuredForce1",
+                "measuredForce2",
+                "measuredForce3",
+                "measuredForce4",
+                "measuredForce5",
+            ],
+            noWarn=True,
+        )
+        if "private_sndStamp" not in self.query_dict["hpmf"].keys():
+            print("no hpmf data")
+            self.query_dict = None
+            return
+        self.query_dict["hpmf"] = self.add_timestamp(self.query_dict["hpmf"])
 
         self.query_dict["el"] = getEfdData(
             client,
@@ -172,29 +196,7 @@ class identify_oscillation_events:
             return
         self.query_dict["az"] = self.add_timestamp(self.query_dict["az"])
 
-        self.query_dict["hpmf"] = getEfdData(
-            client,
-            "lsst.sal.MTM1M3.hardpointActuatorData",
-            begin=begin,
-            end=end,
-            prePadding=5,
-            postPadding=5,
-            columns=[
-                "private_sndStamp",
-                "measuredForce0",
-                "measuredForce1",
-                "measuredForce2",
-                "measuredForce3",
-                "measuredForce4",
-                "measuredForce5",
-            ],
-            noWarn=True,
-        )
-        if "private_sndStamp" not in self.query_dict["hpmf"].keys():
-            print("no hpmf data")
-            self.query_dict = None
-            return
-        self.query_dict["hpmf"] = self.add_timestamp(self.query_dict["hpmf"])
+        
 
     def get_single_slew_data_dict(self, event):
         slew_dict = {}
@@ -206,7 +208,10 @@ class identify_oscillation_events:
             else:
                 slew_dict[key] = self.query_dict[key]
         slew_dict["seq_num"] = event.seqNum
-
+        
+        for key in self.query_dict.keys():
+            if len(slew_dict[key]) < 1:
+                return None
         return slew_dict
 
     def identify(self, data_dict):
@@ -214,7 +219,10 @@ class identify_oscillation_events:
             return None
 
         peak_dict = {}
-        peak_frame = pd.DataFrame({"times": [], "heights": [], "actuators": []})
+        peak_frame = pd.DataFrame({"times": [], 
+                                   "heights": [], 
+                                   "actuators": [],
+                                   "rmean_diff":[]})
         for i in range(6):
             # this loop identifies rolling std peaks in the measured force
             rolling_std_val = (
@@ -262,24 +270,29 @@ class identify_oscillation_events:
                 super_times.append(peak_dict[f"hp_{i}_peak_times"][max_index])
                 super_heights.append(peak_dict[f"hp_{i}_peak_heights"][max_index])
                 super_rmean.append(peak_dict[f"hp_{i}_peak_rmean_diff"][max_index])
-            peak_dict[f"hp_{i}_peak_times"] = np.unique(super_times)
-            peak_dict[f"hp_{i}_peak_heights"] = np.unique(super_heights)
-            peak_dict[f"hp_{i}_peak_rmean_diff"] = np.unique(super_rmean)
+            if len(super_times) > 0:
 
-            peak_frame = pd.concat(
-                [
-                    peak_frame,
-                    pd.DataFrame(
-                        {
-                            "times": peak_dict[f"hp_{i}_peak_times"],
-                            "heights": peak_dict[f"hp_{i}_peak_heights"],
-                            "rmean_diff": peak_dict[f"hp_{i}_peak_rmean_diff"],
-                            "actuators": i,
-                        }
-                    ),
-                ]
-            )
-            peak_frame = peak_frame.sort_values("times")
+                peak_dict[f"hp_{i}_peak_times"], time_index = np.unique(np.concatenate(super_times), return_index=True)
+                peak_dict[f"hp_{i}_peak_heights"] = np.concatenate(super_heights)[time_index]
+                peak_dict[f"hp_{i}_peak_rmean_diff"] = np.concatenate(super_rmean)[time_index]
+                try:
+                    new_frame=pd.DataFrame(
+                                {
+                                    "times": peak_dict[f"hp_{i}_peak_times"],
+                                    "heights": peak_dict[f"hp_{i}_peak_heights"],
+                                    "rmean_diff": peak_dict[f"hp_{i}_peak_rmean_diff"],
+                                    "actuators": i,
+                                }
+                            )
+                except:
+                    import pdb; pdb.set_trace()
+                peak_frame = pd.concat(
+                    [
+                        peak_frame,
+                        new_frame,
+                    ], 
+                )
+        peak_frame = peak_frame.sort_values("times")
 
         # next we want to combine peaks across actuators
         overall_frame = self.combine_peaks_accross_actuators(
@@ -322,7 +335,7 @@ class identify_oscillation_events:
         overall_frame["elevation_velocity"] = slew_velocity_el(overall_frame["times"])
         overall_frame["azimuth_velocity"] = slew_velocity_az(overall_frame["times"])
         overall_frame["elevation_position"] = slew_position(overall_frame["times"])
-        overall_frame = overall_frame.loc[overall_frame["slew_state"] is True, :]
+        overall_frame = overall_frame.loc[overall_frame["slew_state"] == True, :]
 
         if len(overall_frame) > 0:
             overall_frame["seq_num"] = data_dict["seq_num"]
@@ -349,6 +362,8 @@ class identify_oscillation_events:
 
         for slew in tqdm(self.slews):
             slew_dict = self.get_single_slew_data_dict(slew)
+            if slew_dict is None:
+                continue
             result = self.identify(slew_dict)
             if result is not None:
                 event_list.append(result)
@@ -366,8 +381,8 @@ if __name__ == "__main__":
     if not os.path.exists("./data/"):
         os.makedirs("./data/")
 
-    begin_day_obs = 20230616
-    end_day_obs = 20230627
+    begin_day_obs = 20230601
+    end_day_obs = 20230618
 
     id_oscillations = identify_oscillation_events()
 
